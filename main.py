@@ -178,13 +178,23 @@ def ensure_valid_token():
 PROMPT_TEMPLATE = """
 You are a generator that returns ONLY JSON. No code fences, no commentary.
 
-Generate 1 original, highly engaging short motivational quote in first-person style
-and create the best possible YouTube metadata for a video based on this quote.
+Generate 1 original, highly engaging short motivational quote in first-person style and return strictly in JSON format with no extra text, explanations, or commentary. The quote must:
+
+- Be 1–2 lines long not too much long keep it shorter and very deep.
+- Use very simple, clear, and powerful English that immediately connects with anyone reading not any hard words daily life using words.
+- Show a vivid contrast (e.g., failure vs. success, struggle vs. breakthrough, fear vs. courage).
+- Fully Humanized and never use any hard word easy to understad words daily life using words.
+- Evoke strong emotion and a sense of unstoppable motivation.
+- End with a positive, uplifting, and inspiring outcome that sparks action.
+- Focus on motivation, success, entrepreneurship, or life lessons.
+- Avoid copying any existing quotes; make it unique and memorable.
+- Use mindset for quotes like top bewt motivational speakers.
+- Use first-person words (I, me, my) to make it personal, relatable, and human-like.
+- Include a short, punchy, attention-grabbing title in first-person style that reflects the essence of the quote two people understad quote topic and have best hook to user never skip and relatable.
 
 Constraints:
-- Quote: 1–3 lines; simple, clear, powerful; strong contrast (failure→success, struggle→breakthrough, fear→courage); uplifting ending; first-person; unique.
 - "title": Short, humanized version of the quote (<100 chars).
-- "youtube_title": Highly clickable, SEO-friendly, <100 chars.
+- "youtube_title": Highly clickable, SEO-friendly, in simple english <100 chars.
 - "youtube_description": Long, natural, includes:
   - The quote
   - Brief story-like summary that connects with viewers
@@ -360,10 +370,10 @@ def _load_font(path, size):
     return ImageFont.load_default()
 
 # ---------- Fast frame-based video generator ----------
-FADE_DELAY = float(os.getenv("FADE_DELAY", "0.5"))
-FADE_DURATION = float(os.getenv("FADE_DURATION", "1.2"))
+FADE_DELAY = float(os.getenv("FADE_DELAY", "1.5"))
+FADE_DURATION = float(os.getenv("FADE_DURATION", "2"))
 HOLD_DURATION = float(os.getenv("HOLD_DURATION", "3"))
-FADE_OUT_DURATION = float(os.getenv("FADE_OUT_DURATION", "1.2"))
+FADE_OUT_DURATION = float(os.getenv("FADE_OUT_DURATION", "2"))
 
 FRAMES_DIR_BASE = APP_DIR / "tmp" / "frames"
 
@@ -441,13 +451,17 @@ def generate_static_layers(header_text: str, quote_text: str, width=WIDTH, heigh
     return header_img.convert("RGBA"), content_img.convert("RGBA")
 
 def generate_frames_and_encode(header_img: Image.Image, content_img: Image.Image, out_video: Path,
-                               duration: int = DURATION_TOTAL, fps: int = FPS, tmpdir: Path = None):
-    if tmpdir is None:
-        tmpdir = FRAMES_DIR_BASE / f"gen_{int(time.time())}"
-    frames_dir = tmpdir
+                               duration: int = DURATION_TOTAL, fps: int = FPS):
+    # Always use one fixed frames folder
+    frames_dir = FRAMES_DIR_BASE / "frames"
+
+    # Cleanup before starting new generation
     if frames_dir.exists():
         shutil.rmtree(frames_dir)
     frames_dir.mkdir(parents=True, exist_ok=True)
+
+    if out_video.exists():
+        out_video.unlink()  # delete old video so new one replaces it
 
     fade_delay = FADE_DELAY
     fade_in = FADE_DURATION
@@ -516,12 +530,14 @@ def generate_frames_and_encode(header_img: Image.Image, content_img: Image.Image
             log.error("ffmpeg encode failed: %s", proc.stderr.decode(errors="ignore")[:2000])
             raise RuntimeError("ffmpeg encoding failed")
 
+    # Cleanup frames after encoding
     try:
         shutil.rmtree(frames_dir)
     except Exception:
         pass
-    return out_video
 
+    return out_video
+    
 def pick_random_audio():
     if not MUSIC_DIR.exists():
         return None
@@ -703,7 +719,7 @@ def generate_and_upload():
     youtube_description = gemini_data['youtube_description']
     youtube_tags = gemini_data['youtube_tags']
 
-    tmpdir = APP_DIR / "tmp" / f"gen_{int(time.time())}"
+    tmpdir = APP_DIR / "tmp" / f"video"
     tmpdir.mkdir(parents=True, exist_ok=True)
 
     # Generate static video layers
@@ -713,7 +729,7 @@ def generate_and_upload():
 
     # Generate frames and encode video
     try:
-        generate_frames_and_encode(header_img, content_img, out_video_tmp, duration=duration, fps=FPS, tmpdir=tmpdir / "frames")
+        generate_frames_and_encode(header_img, content_img, out_video_tmp, duration=duration, fps=FPS)
     except Exception as e:
         log.exception("video generation failed")
         return jsonify({'ok': False, 'error': str(e)})
