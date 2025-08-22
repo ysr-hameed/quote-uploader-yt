@@ -48,6 +48,48 @@ GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "45"))
 GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.35"))
 GEMINI_MAX_TOKENS = int(os.getenv("GEMINI_MAX_TOKENS", "1200"))  # long desc + 100+ hashtags
 
+
+
+FACEBOOK_PAGE_ID = os.getenv("FACEBOOK_PAGE_ID")
+FACEBOOK_ACCESS_TOKEN = os.getenv("FACEBOOK_ACCESS_TOKEN")
+INSTAGRAM_USER_ID = os.getenv("INSTAGRAM_USER_ID")
+
+def upload_facebook_video(video_path, title, description):
+    url = f"https://graph-video.facebook.com/{FACEBOOK_PAGE_ID}/videos"
+    files = {'source': open(video_path, 'rb')}
+    data = {
+        'title': title,
+        'description': description,
+        'access_token': FACEBOOK_ACCESS_TOKEN
+    }
+    resp = requests.post(url, files=files, data=data)
+    return resp.json()
+
+def upload_instagram_reel(video_path, caption):
+    # Step 1: Upload video to IG container
+    url = f"https://graph-video.facebook.com/{INSTAGRAM_USER_ID}/media"
+    files = {'video_file': open(video_path, 'rb')}
+    data = {
+        'caption': caption,
+        'media_type': 'VIDEO',
+        'access_token': FACEBOOK_ACCESS_TOKEN
+    }
+    resp = requests.post(url, files=files, data=data).json()
+    
+    if 'id' not in resp:
+        return resp
+    
+    creation_id = resp['id']
+
+    # Step 2: Publish media
+    publish_url = f"https://graph.facebook.com/{INSTAGRAM_USER_ID}/media_publish"
+    publish_data = {
+        'creation_id': creation_id,
+        'access_token': FACEBOOK_ACCESS_TOKEN
+    }
+    publish_resp = requests.post(publish_url, data=publish_data).json()
+    return publish_resp
+    
 # OAuth / YouTube
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
@@ -711,7 +753,7 @@ def generate_and_upload():
     duration = int(request.args.get('duration', str(DURATION_TOTAL)))
     duration = max(3, min(MAX_DURATION, duration))
 
-    # Fetch quote + YouTube metadata from Gemini
+    # Fetch quote + YouTube metadata
     gemini_data = fetch_quote_from_gemini(topic)
     quote_title = gemini_data['title']
     quote_text = gemini_data['quote']
@@ -719,22 +761,19 @@ def generate_and_upload():
     youtube_description = gemini_data['youtube_description']
     youtube_tags = gemini_data['youtube_tags']
 
-    tmpdir = APP_DIR / "tmp" / f"video"
+    tmpdir = APP_DIR / "tmp" / "video"
     tmpdir.mkdir(parents=True, exist_ok=True)
 
-    # Generate static video layers
     header_img, content_img = generate_static_layers(quote_title, quote_text, width=WIDTH, height=HEIGHT)
     out_video_tmp = tmpdir / "out_no_audio.mp4"
     out_video_final = tmpdir / "out_final.mp4"
 
-    # Generate frames and encode video
     try:
         generate_frames_and_encode(header_img, content_img, out_video_tmp, duration=duration, fps=FPS)
     except Exception as e:
         log.exception("video generation failed")
         return jsonify({'ok': False, 'error': str(e)})
 
-    # Optional audio mux
     audio = pick_random_audio()
     if audio:
         try:
@@ -762,13 +801,31 @@ def generate_and_upload():
         'file': str(final_video)
     }
 
+    # ---------- UPLOAD SECTION ----------
     if not skip_upload:
+        # YouTube Upload
         try:
             upload_resp = upload_video_resumable(final_video, youtube_title, youtube_description, youtube_tags, privacyStatus=privacy)
-            result['upload'] = upload_resp
+            result['upload_youtube'] = upload_resp
         except Exception as e:
-            log.warning("upload failed: %s", e)
-            result['upload_error'] = str(e)
+            log.warning("YouTube upload failed: %s", e)
+            result['upload_youtube_error'] = str(e)
+
+        # Facebook Upload
+        try:
+            fb_resp = upload_facebook_video(final_video, youtube_title, youtube_description)
+            result['upload_facebook'] = fb_resp
+        except Exception as e:
+            log.warning("Facebook upload failed: %s", e)
+            result['upload_facebook_error'] = str(e)
+
+        # Instagram Upload
+        try:
+            ig_resp = upload_instagram_reel(final_video, youtube_title)
+            result['upload_instagram'] = ig_resp
+        except Exception as e:
+            log.warning("Instagram upload failed: %s", e)
+            result['upload_instagram_error'] = str(e)
 
     return jsonify(result)
 
