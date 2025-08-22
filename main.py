@@ -51,11 +51,16 @@ GEMINI_MAX_TOKENS = int(os.getenv("GEMINI_MAX_TOKENS", "1200"))  # long desc + 1
 
 
 FACEBOOK_PAGE_ID = os.getenv("FACEBOOK_PAGE_ID")
-FACEBOOK_ACCESS_TOKEN = os.getenv("FACEBOOK_ACCESS_TOKEN")
+FACEBOOK_ACCESS_TOKEN = os.getenv("FACEBOOK_ACCESS_TOKEN")  # Make sure this is a PAGE access token
 INSTAGRAM_USER_ID = os.getenv("INSTAGRAM_USER_ID")
 
+
 def upload_facebook_video(video_path, title, description):
-    url = f"https://graph-video.facebook.com/{FACEBOOK_PAGE_ID}/videos"
+    """
+    Uploads a video directly to a Facebook Page.
+    Requires a PAGE access token with 'pages_manage_posts'.
+    """
+    url = f"https://graph-video.facebook.com/v19.0/{FACEBOOK_PAGE_ID}/videos"
     files = {'source': open(video_path, 'rb')}
     data = {
         'title': title,
@@ -65,24 +70,31 @@ def upload_facebook_video(video_path, title, description):
     resp = requests.post(url, files=files, data=data)
     return resp.json()
 
+
 def upload_instagram_reel(video_path, caption):
-    # Step 1: Upload video to IG container
-    url = f"https://graph-video.facebook.com/{INSTAGRAM_USER_ID}/media"
+    """
+    Uploads a Reel to Instagram.
+    Step 1: Create media container with media_type=REELS.
+    Step 2: Publish container.
+    Requires 'instagram_content_publish' permission.
+    """
+    # Step 1: Upload to container
+    url = f"https://graph-video.facebook.com/v19.0/{INSTAGRAM_USER_ID}/media"
     files = {'video_file': open(video_path, 'rb')}
     data = {
         'caption': caption,
-        'media_type': 'VIDEO',
+        'media_type': 'REELS',  # <-- FIXED (VIDEO is deprecated)
         'access_token': FACEBOOK_ACCESS_TOKEN
     }
     resp = requests.post(url, files=files, data=data).json()
-    
+
     if 'id' not in resp:
-        return resp
-    
+        return {"error": resp}
+
     creation_id = resp['id']
 
-    # Step 2: Publish media
-    publish_url = f"https://graph.facebook.com/{INSTAGRAM_USER_ID}/media_publish"
+    # Step 2: Publish
+    publish_url = f"https://graph.facebook.com/v19.0/{INSTAGRAM_USER_ID}/media_publish"
     publish_data = {
         'creation_id': creation_id,
         'access_token': FACEBOOK_ACCESS_TOKEN
