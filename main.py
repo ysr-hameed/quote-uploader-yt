@@ -345,7 +345,7 @@ def generate_static_layers(header_text: str, quote_text: str, width=WIDTH, heigh
                 content_draw.text((cursor + pad, y), p, font=font_quote, fill=(0, 0, 0))
                 cursor += rect_w + content_draw.textlength(" ", font=font_quote)
             else:
-                content_draw.text((cursor, y), text_block, font=font_quote, fill=(255, 255, 255))
+                content_draw.text((cursor, y), text_block, font=font_quote, fill=(0, 0, 0, 255))
                 cursor += tw
 
     return header_img.convert("RGBA"), content_img.convert("RGBA")
