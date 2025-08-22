@@ -44,7 +44,9 @@ MODEL_URL = os.getenv(
     "GEMINI_MODEL_URL",
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 )
-GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "35"))
+GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "45"))
+GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.35"))
+GEMINI_MAX_TOKENS = int(os.getenv("GEMINI_MAX_TOKENS", "1200"))  # long desc + 100+ hashtags
 
 # OAuth / YouTube
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -103,7 +105,7 @@ def _save_tokens(obj):
     except Exception:
         log.exception("failed to save tokens")
 
-# OAuth helpers (unchanged logic)
+# OAuth helpers
 def _build_auth_url(state: str):
     params = {
         "client_id": GOOGLE_CLIENT_ID,
@@ -172,87 +174,181 @@ def ensure_valid_token():
         log.error("Failed to refresh token: %s", e)
         return None
 
-# ---------- Gemini call & parsing ----------
-PROMPT_TEMPLATE = (
-    "Generate one original, highly engaging short motivational quote and return strictly in JSON format "
-    "with no extra text, explanations, or commentary.\n\n"
-    "Return JSON:\n"
-    "{\n"
-    "  \"title\": \"<catchy first-person title>\",\n"
-    "  \"quote\": \"<1-3 line motivational quote in first-person simple words>\"\n"
-    "}\n"
-)
+# ---------- Gemini prompt (updated for forced-JSON) ----------
+PROMPT_TEMPLATE = """
+You are a generator that returns ONLY JSON. No code fences, no commentary.
 
-def _call_gemini(prompt: str, timeout: int = GEMINI_TIMEOUT):
+Generate 1 original, highly engaging short motivational quote in first-person style
+and create the best possible YouTube metadata for a video based on this quote.
+
+Constraints:
+- Quote: 1–3 lines; simple, clear, powerful; strong contrast (failure→success, struggle→breakthrough, fear→courage); uplifting ending; first-person; unique.
+- "title": Short, humanized version of the quote (<100 chars).
+- "youtube_title": Highly clickable, SEO-friendly, <100 chars.
+- "youtube_description": Long, natural, includes:
+  - The quote
+  - Brief story-like summary that connects with viewers
+  - Friendly CTA
+  - These details woven in naturally:
+      Name: Yasir Hameed
+      Email: ysr.hameed.yh@gmail.com
+      Instagram: @ysr_hameed
+      LinkedIn: https://www.linkedin.com/in/yasir-hameed-59b70b36b?utm_source=share&utm_campaign=share_via&utm_content=profile&utm_medium=android_app
+      Facebook: https://www.facebook.com/share/16nphS1fR7/
+      Website: https://ysr.free.nf
+      Channel Name: Motivation Hub
+      Channel Description: My channel shares motivational quotes, life lessons, success tips, and short videos for personal growth.
+  - End with 100+ relevant hashtags (motivation, success, entrepreneurship, life lessons, personal growth).
+- "youtube_tags": 12–20 highly relevant, SEO-friendly tags.
+
+Return strictly in this JSON shape:
+{
+  "title": "<quote title>",
+  "quote": "<the motivational quote>",
+  "youtube_title": "<Humanized, SEO optimized YouTube title>",
+  "youtube_description": "<Long, engaging, humanized YouTube description including all details and 100+ hashtags>",
+  "youtube_tags": ["tag1", "tag2", "..."]
+}
+"""
+
+def _strip_code_fences(text: str) -> str:
+    # Remove ```json ... ``` or ``` ... ``` wrappers and stray backticks
+    if not text:
+        return text
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text.strip(), flags=re.IGNORECASE)
+    return text.strip()
+
+def _extract_first_json_object(text: str):
+    """
+    Robustly extract the first top-level JSON object from text (if any).
+    """
+    if not text:
+        return None
+    text = _strip_code_fences(text)
+
+    # Fast path: direct parse
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Brace-balance scan
+    start = text.find("{")
+    if start == -1:
+        return None
+    brace = 0
+    for i, ch in enumerate(text[start:], start=start):
+        if ch == "{":
+            brace += 1
+        elif ch == "}":
+            brace -= 1
+            if brace == 0:
+                snippet = text[start:i+1]
+                try:
+                    return json.loads(snippet)
+                except Exception:
+                    continue
+    return None
+
+def _enforce_schema(d: dict) -> dict:
+    # Ensure required keys exist and types are right; fill light defaults.
+    if not isinstance(d, dict):
+        d = {}
+    return {
+        "title": str(d.get("title") or "I Rise"),
+        "quote": str(d.get("quote") or "I fell, I learned, and now I rise with fearless focus."),
+        "youtube_title": str(d.get("youtube_title") or "I Rise | Motivational Quote for Success"),
+        "youtube_description": str(d.get("youtube_description") or "I fell, I learned, and now I rise with fearless focus. Subscribe for daily motivation."),
+        "youtube_tags": list(d.get("youtube_tags") or ["motivation", "success", "life lessons", "self improvement"])
+    }
+
+def _call_gemini(prompt: str, timeout: int = GEMINI_TIMEOUT, retries: int = 2):
+    """
+    Force JSON response via responseMimeType and parse deterministically.
+    """
     if not API_KEY:
         raise RuntimeError("GEMINI_API_KEY is required")
+
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.25, "maxOutputTokens": 200}
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": GEMINI_TEMPERATURE,
+            "maxOutputTokens": GEMINI_MAX_TOKENS,
+            "responseMimeType": "application/json"
+        }
     }
     headers = {"Content-Type": "application/json", "x-goog-api-key": API_KEY}
-    with _timeit("gemini_call"):
-        r = SESSION.post(MODEL_URL, headers=headers, json=payload, timeout=timeout)
-        r.raise_for_status()
-        data = r.json()
-        # robust extraction
-        text = None
+
+    last_err = None
+    for attempt in range(retries + 1):
         try:
-            text = (
+            with _timeit("gemini_call"):
+                r = SESSION.post(MODEL_URL, headers=headers, json=payload, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+
+            # Read concatenated parts text if present
+            parts = (
                 data.get("candidates", [{}])[0]
                 .get("content", {})
-                .get("parts", [{}])[0]
-                .get("text")
+                .get("parts", [])
             )
-        except Exception:
-            text = None
-        if not text:
-            text = json.dumps(data)
-        return text
+            text = "".join([p.get("text", "") for p in parts]) if parts else ""
 
+            if not text:
+                # Sometimes the API may return a top-level "promptFeedback" error or empty text
+                log.warning("Gemini returned empty text; raw=%s", json.dumps(data)[:2000])
+                # Try to fall back to entire JSON string of candidate
+                text = json.dumps(data.get("candidates", [{}])[0].get("content", {}))
 
+            # Try direct JSON load, else extract
+            try:
+                obj = json.loads(_strip_code_fences(text))
+            except Exception:
+                obj = _extract_first_json_object(text)
+
+            if not obj:
+                log.warning("Failed to parse JSON from Gemini text; beginning extraction fallback")
+                obj = _extract_first_json_object(text)
+
+            if not obj:
+                raise ValueError("No JSON object could be parsed from Gemini response")
+
+            # Enforce schema
+            obj = _enforce_schema(obj)
+            return obj
+
+        except Exception as e:
+            last_err = e
+            log.warning("Gemini attempt %d failed: %s", attempt + 1, e)
+            time.sleep(0.6 * (attempt + 1))
+
+    # Total failure: return sane defaults
+    log.warning("Gemini call failed after retries, using fallback. Last error: %s", last_err)
+    return _enforce_schema({})
 
 def parse_gemini_json_block_safe(text: str):
     """
-    Extract the first JSON object from a Gemini response safely,
-    ignoring unsupported regex constructs like ?R.
+    Kept for compatibility; now unused by fetch_quote_from_gemini.
     """
-    # Remove code block markers or other decorations
-    text = re.sub(r"```json|```", "", text, flags=re.IGNORECASE).strip()
-
-    # Attempt to find the first { ... } block manually
-    start = text.find("{")
-    if start == -1:
-        log.warning("No JSON object found in Gemini text")
-        return None
-
-    brace_count = 0
-    for i, c in enumerate(text[start:], start=start):
-        if c == "{":
-            brace_count += 1
-        elif c == "}":
-            brace_count -= 1
-            if brace_count == 0:
-                candidate = text[start:i+1]
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    # If parse fails, skip unknown characters and retry
-                    continue
-    log.warning("Failed to parse any JSON block from Gemini response")
-    return None
-
-def fetch_quote_from_gemini(seed="motivation"):
+    text = re.sub(r"```json|```", "", str(text or ""), flags=re.IGNORECASE).strip()
     try:
-        raw = _call_gemini(PROMPT_TEMPLATE + f"\nTopic: {seed}\n")
-        parsed = parse_gemini_json_block_safe(raw)  # <-- use 'raw' here
-        if parsed and parsed.get("quote"):
-            return parsed.get("title") or "I Rise", parsed.get("quote")
-        log.warning("Gemini returned no parsed JSON, using fallback")
+        return json.loads(text)
+    except Exception:
+        return _extract_first_json_object(text)
+
+# ---------- Fetcher ----------
+def fetch_quote_from_gemini(seed="motivation"):
+    prompt = PROMPT_TEMPLATE + f"\nTopic: {seed}\n"
+    try:
+        parsed = _call_gemini(prompt)
+        return parsed
     except Exception as e:
         log.warning("Gemini call failed: %s", e)
+
     # fallback
-    return "I Rise", "I fell, I learned, and now I rise with fearless focus."
+    return _enforce_schema({})
 
 # ---------- Fonts ----------
 def _load_font(path, size):
@@ -264,18 +360,14 @@ def _load_font(path, size):
     return ImageFont.load_default()
 
 # ---------- Fast frame-based video generator ----------
-# fade/hold parameters (seconds) - tuned for fast, natural feel
-FADE_DELAY = float(os.getenv("FADE_DELAY", "0.5"))         # delay before fade starts
-FADE_DURATION = float(os.getenv("FADE_DURATION", "1.2"))   # fade-in duration
-HOLD_DURATION = float(os.getenv("HOLD_DURATION", "3"))     # will be computed from total
+FADE_DELAY = float(os.getenv("FADE_DELAY", "0.5"))
+FADE_DURATION = float(os.getenv("FADE_DURATION", "1.2"))
+HOLD_DURATION = float(os.getenv("HOLD_DURATION", "3"))
 FADE_OUT_DURATION = float(os.getenv("FADE_OUT_DURATION", "1.2"))
-
-# We'll compute HOLD_DURATION later based on DURATION_TOTAL
 
 FRAMES_DIR_BASE = APP_DIR / "tmp" / "frames"
 
 def generate_static_layers(header_text: str, quote_text: str, width=WIDTH, height=HEIGHT):
-    # choose font sizes relative to width
     header_font_size = max(28, width // 14)
     quote_font_size = max(26, width // 20)
     font_header = _load_font(HEADER_FONT_PATH, header_font_size)
@@ -329,7 +421,6 @@ def generate_static_layers(header_text: str, quote_text: str, width=WIDTH, heigh
     for i, line in enumerate(lines):
         x = margin_x
         y = y_start + i * line_h
-        # simple highlight: highlight words in HIGHLIGHT_WORDS
         parts = line.split(" ")
         cursor = x
         for j, p in enumerate(parts):
@@ -337,7 +428,6 @@ def generate_static_layers(header_text: str, quote_text: str, width=WIDTH, heigh
             text_block = p + (" " if j != len(parts) - 1 else "")
             tw = content_draw.textlength(text_block, font=font_quote)
             if clean in {"success", "focus", "rise", "win", "courage", "learn", "fearless", "fight"}:
-                # draw rounded-ish rect (simple)
                 pad = 6
                 rect_w = content_draw.textlength(p, font=font_quote) + pad * 2
                 rect_h = getattr(font_quote, "size", quote_font_size) + 6
@@ -352,12 +442,6 @@ def generate_static_layers(header_text: str, quote_text: str, width=WIDTH, heigh
 
 def generate_frames_and_encode(header_img: Image.Image, content_img: Image.Image, out_video: Path,
                                duration: int = DURATION_TOTAL, fps: int = FPS, tmpdir: Path = None):
-    """
-    Fast frame generator:
-      - Precompute blended frames with alpha computed per frame using simple easing
-      - Overlay header_img (png alpha) onto each blended frame
-      - Save frames as PNG or JPG then call ffmpeg to encode
-    """
     if tmpdir is None:
         tmpdir = FRAMES_DIR_BASE / f"gen_{int(time.time())}"
     frames_dir = tmpdir
@@ -365,13 +449,11 @@ def generate_frames_and_encode(header_img: Image.Image, content_img: Image.Image
         shutil.rmtree(frames_dir)
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    # compute hold duration to fit total
     fade_delay = FADE_DELAY
     fade_in = FADE_DURATION
     fade_out = FADE_OUT_DURATION
     hold = duration - (fade_delay + fade_in + fade_out)
     if hold < 0:
-        # reduce fade durations proportionally if total too small
         scale = duration / (fade_delay + fade_in + fade_out)
         fade_delay *= scale
         fade_in *= scale
@@ -381,7 +463,6 @@ def generate_frames_and_encode(header_img: Image.Image, content_img: Image.Image
     total_frames = max(1, int(round(duration * fps)))
     frames = total_frames
 
-    # Precompute per-frame alpha (0..1) for content_img
     alphas = []
     for i in range(frames):
         t = i / fps
@@ -395,14 +476,9 @@ def generate_frames_and_encode(header_img: Image.Image, content_img: Image.Image
             a = 1.0 - (t - (fade_delay + fade_in + hold)) / fade_out
         else:
             a = 0.0
-        # clamp
-        if a < 0:
-            a = 0.0
-        if a > 1:
-            a = 1.0
+        a = max(0.0, min(1.0, a))
         alphas.append(a)
 
-    # Use a black base to blend from (produces fade-in effect). For performance, prepare base image
     base = Image.new("RGBA", (content_img.width, content_img.height), (0, 0, 0, 255))
 
     start_time = time.time()
@@ -412,14 +488,10 @@ def generate_frames_and_encode(header_img: Image.Image, content_img: Image.Image
         elif alpha >= 1:
             blended = content_img
         else:
-            # blend returns new image (fast C code)
             blended = Image.blend(base, content_img, alpha)
-        # overlay header on top (alpha composite)
         frame = blended.copy()
         frame.alpha_composite(header_img)
-        # convert to RGB for ffmpeg speed (smaller files) — remove alpha
         frame_rgb = frame.convert("RGB")
-        # use JPEG to reduce disk usage but acceptable quality
         frame_path = frames_dir / f"frame_{idx:05d}.jpg"
         frame_rgb.save(frame_path, "JPEG", quality=85, optimize=True)
         if (idx + 1) % 10 == 0 or idx == frames - 1:
@@ -429,15 +501,6 @@ def generate_frames_and_encode(header_img: Image.Image, content_img: Image.Image
             print(f"[INFO] Frame {idx+1}/{frames} | {fps_now:.2f} fps | ETA {remaining:.1f}s", end="\r")
     print()
 
-    # Encode with ffmpeg (image sequence)
-    # Create list file for ffmpeg to be robust across platforms
-    list_file = frames_dir / "inputs.txt"
-    with list_file.open("w", encoding="utf-8") as f:
-        for i in range(frames):
-            p = frames_dir / f"frame_{i:05d}.jpg"
-            f.write(f"file '{p.resolve()}'\n")
-            # set duration per frame using -r at input is enough for constant framerate; using image2pipe can be fragile.
-    # ffmpeg invocation — set framerate and encode
     cmd = [
         "ffmpeg", "-y",
         "-framerate", str(fps),
@@ -453,7 +516,6 @@ def generate_frames_and_encode(header_img: Image.Image, content_img: Image.Image
             log.error("ffmpeg encode failed: %s", proc.stderr.decode(errors="ignore")[:2000])
             raise RuntimeError("ffmpeg encoding failed")
 
-    # cleanup frames_dir (optional)
     try:
         shutil.rmtree(frames_dir)
     except Exception:
@@ -467,7 +529,6 @@ def pick_random_audio():
     return random.choice(files) if files else None
 
 def mux_audio_to_video(video_path: Path, out_path: Path, audio_path: Path):
-    # loop audio as necessary and trim to video duration
     cmd = [
         "ffmpeg", "-y",
         "-i", str(video_path),
@@ -504,12 +565,16 @@ def upload_video_resumable(video_path: Path, title: str, description: str, tags:
         headers = _auth_headers()
         params = {"uploadType": "resumable", "part": "snippet,status"}
         metadata = {
-            "snippet": {"title": title, "description": description, "tags": tags[:15]},
+            "snippet": {
+                "title": title,
+                "description": description,
+                "tags": (tags or [])[:15]
+            },
             "status": {"privacyStatus": privacyStatus}
         }
         init_headers = headers.copy()
         init_headers.update({"Content-Type": "application/json; charset=UTF-8"})
-        r = SESSION.post(YOUTUBE_UPLOAD_URL, headers=init_headers, params=params, json=metadata, timeout=15)
+        r = SESSION.post(YOUTUBE_UPLOAD_URL, headers=init_headers, params=params, json=metadata, timeout=30)
         r.raise_for_status()
         upload_url = r.headers.get("Location")
         if not upload_url:
@@ -533,6 +598,13 @@ def upload_video_resumable(video_path: Path, title: str, description: str, tags:
 def health():
     return {"status": "ok", "message": "Service running"}, 200
 
+@app.get("/debug/gemini")
+def debug_gemini():
+    topic = request.args.get("topic", "motivation")
+    prompt = PROMPT_TEMPLATE + f"\nTopic: {topic}\n"
+    obj = _call_gemini(prompt)
+    return jsonify({"ok": True, "parsed": obj})
+
 @app.get("/")
 def index():
     has_tokens = bool(_load_tokens())
@@ -545,13 +617,16 @@ def index():
         <p>
           <a href='/auth/start'>Authorize YouTube</a> |
           <a href='/auth/revoke'>Revoke Authorization</a> |
-          <a href='/channels'>List My Channels</a>
+          <a href='/channels'>List My Channels</a> |
+          <a href='/debug/gemini?topic=motivation'>Test Gemini JSON</a>
         </p>
         <h2>Generate & Upload (fast frames)</h2>
         <form action='/generate-and-upload' method='get'>
           Topic: <input name='topic' value='motivation' />
           Privacy: <select name='privacy'><option>public</option><option>unlisted</option><option>private</option></select>
-          <button type='submit'>Generate & Upload</button>
+          Duration (sec): <input name='duration' value='{DURATION_TOTAL}' style='width:80px' />
+          <label><input type='checkbox' name='no_upload' value='1'/> Skip upload</label>
+          <button type='submit'>Generate</button>
         </form>
         <p>Fast generator uses pre-rendered frames + ffmpeg for faster, consistent output.</p>
         <hr/>
@@ -614,34 +689,41 @@ def channels_endpoint():
 
 @app.get('/generate-and-upload')
 def generate_and_upload():
-    # Now auto-uploads by default. If 'no_upload=1' present, skip upload.
     topic = request.args.get('topic', 'motivation')
     privacy = request.args.get('privacy', 'public')
     skip_upload = request.args.get('no_upload') == '1'
     duration = int(request.args.get('duration', str(DURATION_TOTAL)))
+    duration = max(3, min(MAX_DURATION, duration))
 
-    title, quote = fetch_quote_from_gemini(topic)
-    quote_title = title or topic.title()
-    quote_text = quote or "Keep going, you're closer than you think."
+    # Fetch quote + YouTube metadata from Gemini
+    gemini_data = fetch_quote_from_gemini(topic)
+    quote_title = gemini_data['title']
+    quote_text = gemini_data['quote']
+    youtube_title = gemini_data['youtube_title']
+    youtube_description = gemini_data['youtube_description']
+    youtube_tags = gemini_data['youtube_tags']
 
     tmpdir = APP_DIR / "tmp" / f"gen_{int(time.time())}"
     tmpdir.mkdir(parents=True, exist_ok=True)
+
+    # Generate static video layers
     header_img, content_img = generate_static_layers(quote_title, quote_text, width=WIDTH, height=HEIGHT)
     out_video_tmp = tmpdir / "out_no_audio.mp4"
     out_video_final = tmpdir / "out_final.mp4"
+
+    # Generate frames and encode video
     try:
         generate_frames_and_encode(header_img, content_img, out_video_tmp, duration=duration, fps=FPS, tmpdir=tmpdir / "frames")
     except Exception as e:
         log.exception("video generation failed")
         return jsonify({'ok': False, 'error': str(e)})
 
-    # optional audio mux
+    # Optional audio mux
     audio = pick_random_audio()
     if audio:
         try:
             mux_audio_to_video(out_video_tmp, out_video_final, audio)
             final_video = out_video_final
-            # cleanup interim
             try:
                 out_video_tmp.unlink()
             except Exception:
@@ -652,30 +734,60 @@ def generate_and_upload():
     else:
         final_video = out_video_tmp
 
-    result = {'ok': True, 'generated': {'title': quote_title, 'quote': quote_text}, 'file': str(final_video)}
+    result = {
+        'ok': True,
+        'generated': {
+            'title': quote_title,
+            'quote': quote_text,
+            'youtube_title': youtube_title,
+            'youtube_description': youtube_description,
+            'youtube_tags': youtube_tags
+        },
+        'file': str(final_video)
+    }
+
     if not skip_upload:
         try:
-            # minimal SEO: use quote_title as youtube title, description uses quote text
-            upload_resp = upload_video_resumable(final_video, quote_title, quote_text[:150], [], privacyStatus=privacy)
+            upload_resp = upload_video_resumable(final_video, youtube_title, youtube_description, youtube_tags, privacyStatus=privacy)
             result['upload'] = upload_resp
         except Exception as e:
             log.warning("upload failed: %s", e)
             result['upload_error'] = str(e)
+
     return jsonify(result)
 
 @app.post('/upload')
 def upload_endpoint():
     if 'video' not in request.files:
         return jsonify({'ok': False, 'error': 'no file uploaded'})
+    
     f = request.files['video']
-    title = request.form.get('title') or f.filename or 'Upload'
-    description = request.form.get('description') or ''
-    tags = [t.strip() for t in (request.form.get('tags') or '').split(',') if t.strip()]
+    title = request.form.get('title') or None
+    description = request.form.get('description') or None
+    tags_input = request.form.get('tags') or None
     privacy = request.form.get('privacy') or 'public'
+
+    tags = [t.strip() for t in tags_input.split(',')] if tags_input else []
+
+    if not title or not description or not tags:
+        try:
+            gemini_data = fetch_quote_from_gemini("motivation")
+            if not title:
+                title = gemini_data.get('youtube_title') or f.filename or "Upload"
+            if not description:
+                description = gemini_data.get('youtube_description') or ""
+            if not tags:
+                tags = gemini_data.get('youtube_tags') or []
+        except Exception as e:
+            log.warning("Gemini SEO generation failed: %s", e)
+            title = title or f.filename or "Upload"
+            description = description or ""
+            tags = tags or []
 
     out_path = APP_DIR / 'tmp' / f.filename
     out_path.parent.mkdir(parents=True, exist_ok=True)
     f.save(out_path)
+
     try:
         res = upload_video_resumable(out_path, title, description, tags, privacyStatus=privacy)
         return jsonify({'ok': True, 'file': str(out_path), 'upload': res})
