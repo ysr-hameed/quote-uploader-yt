@@ -199,6 +199,11 @@ PROMPT_TEMPLATE = (
     "- tags: max 6, relevant to motivation, life, success, entrepreneurship.\n"
 )
 
+
+@app.route("/health", methods=["GET"])
+def health():
+    return {"status": "ok", "message": "Service running"}, 200
+    
 def _call_gemini(prompt: str, timeout: int = GEMINI_TIMEOUT):
     if not API_KEY:
         raise RuntimeError("GEMINI_API_KEY is required")
@@ -253,35 +258,52 @@ def parse_gemini_json_block(text: str):
         log.debug("failed to parse gemini JSON block")
         return None
 
+# Basic SEO helpers: craft better youtube_title with keywords
+SEO_POWER_WORDS = ["Daily", "Motivation", "Success", "Mindset", "Rise", "Hustle", "Focus", "Win"]
+
 def simple_seo_from_text(seed: str, quote: str):
+    seed_kw = seed.title()
+    # make a hooky quote_title
+    quote_title = f"I Rise — {seed_kw}"
+    # craft youtube title with keyword phrases
+    youtube_title = f"{seed_kw} Tips: {random.choice(['Daily Motivation','Success Mindset','Win Today'])}"
     base_tags = [seed, "motivation", "inspiration", "shorts", "success", "daily motivation"]
-    title = f"{seed.title()} Motivation"
-    description = f"{quote} — Short motivational video to lift your day. Watch, share, and subscribe for daily motivation."
+    description = (quote + " — Short motivational video. Subscribe for daily wins.")[:150]
     return {
-        "quote_title": title,
+        "quote_title": quote_title,
         "quote": quote,
-        "youtube_title": title,
+        "youtube_title": youtube_title,
         "description": description,
         "tags": base_tags[:6]
     }
 
-def _enhance_seo(seo: dict):
+
+def _enhance_seo(seo: dict, seed: str = "motivation"):
     # enforce constraints: youtube_title 3-7 words, tags max 6, description <=150 chars
-    yt = seo.get("youtube_title") or seo.get("quote_title") or "Motivation"
+    yt = seo.get("youtube_title") or seo.get("quote_title") or seed.title()
     words = yt.split()
     if len(words) < 3:
-        # append power words to make it punchier
-        yt = (yt + " " + "Rise Now") if yt else "Rise Now"
+        yt = (yt + " " + "Daily Motivation") if yt else "Daily Motivation"
+    # ensure presence of seed keyword
+    if seed.title() not in yt:
+        yt = f"{seed.title()} - {yt}"
     # truncate to 7 words
     seo["youtube_title"] = " ".join(yt.split()[:7])
     tags = seo.get("tags") or []
     if isinstance(tags, list):
+        # ensure seed present
+        if seed not in tags:
+            tags.insert(0, seed)
         seo["tags"] = tags[:6]
     else:
-        seo["tags"] = []
+        seo["tags"] = [seed]
     desc = seo.get("description") or ""
     if len(desc) > 150:
         seo["description"] = desc[:147] + "..."
+    # Ensure quote_title has a hook
+    qt = seo.get("quote_title") or "I Rise"
+    if not qt.lower().startswith("i"):
+        seo["quote_title"] = "I " + qt
     return seo
 
 
@@ -293,7 +315,7 @@ def generate_seo_and_quote(seed="motivation"):
         raw = _call_gemini(PROMPT_TEMPLATE + f"\nTopic: {seed}\n")
         parsed = parse_gemini_json_block(raw)
         if parsed and parsed.get("quote"):
-            parsed = _enhance_seo(parsed)
+            parsed = _enhance_seo(parsed, seed)
             _SIMPLE_CACHE[key] = parsed
             return parsed
         log.warning("Gemini returned no parsed JSON, falling back")
@@ -301,11 +323,13 @@ def generate_seo_and_quote(seed="motivation"):
         log.warning("Gemini failed or unreachable: %s", e)
     fallback_quote = "I fell, I learned, and now I rise with fearless focus."
     fallback = simple_seo_from_text(seed, fallback_quote)
-    fallback = _enhance_seo(fallback)
+    fallback = _enhance_seo(fallback, seed)
     _SIMPLE_CACHE[key] = fallback
     return fallback
 
-# ---------- Image creation ----------
+# ---------- Image creation (with highlighted words) ----------
+HIGHLIGHT_WORDS = {"success", "focus", "rise", "win", "courage", "learn", "fearless", "fight"}
+
 def _load_font(path, size):
     try:
         if Path(path).exists():
@@ -314,31 +338,33 @@ def _load_font(path, size):
         log.debug("failed to load font %s", path, exc_info=True)
     return ImageFont.load_default()
 
+
 def render_base_images(quote_title: str, quote: str, out_dir: Path):
     """
-    Create two images:
-      - header-only image on black background (header bar text) - stays fully black with white text
+    Create three images:
+      - header-only image on white background (header bar text black)
       - full image with background and quote (no shadow on quote)
-    Returns (header_img_path, full_img_path)
+      - full image WITHOUT header (used so header can be overlaid and kept static)
+    Returns (header_img_path, full_img_path, full_no_header_path)
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     header_path = out_dir / "img_header.jpg"
     full_path = out_dir / "img_full.jpg"
+    full_no_header = out_dir / "img_full_no_header.jpg"
 
     # font sizes
-    header_size = max(22, WIDTH // 18)
-    quote_size = max(18, WIDTH // 24)
+    header_size = max(24, WIDTH // 18)
+    quote_size = max(20, WIDTH // 22)
     font_h = _load_font(HEADER_FONT_PATH, header_size)
     font_q = _load_font(QUOTE_FONT_PATH, quote_size)
 
-    # --- header-only black background ---
-    bg = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 255))
+    # --- header-only white background with black text ---
+    bg = Image.new("RGBA", (WIDTH, HEIGHT), (255, 255, 255, 255))
     draw = ImageDraw.Draw(bg)
     header_h = int(HEIGHT * 0.10)
-    # full black background with header text centered near top
     bbox = draw.textbbox((0, 0), quote_title, font=font_h)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    draw.text(((WIDTH - tw) // 2, (header_h - th) // 2), quote_title, font=font_h, fill=(255, 255, 255))
+    draw.text(((WIDTH - tw) // 2, (header_h - th) // 2), quote_title, font=font_h, fill=(0, 0, 0))
     bg.convert("RGB").save(header_path, "JPEG", quality=85, optimize=True)
 
     # --- full image (bg image or light default) ---
@@ -348,19 +374,34 @@ def render_base_images(quote_title: str, quote: str, out_dir: Path):
             bg2 = ImageOps.fit(bg2, (WIDTH, HEIGHT), method=Image.LANCZOS)
         except Exception:
             log.warning("BG present but failed loading; using plain")
-            bg2 = Image.new("RGBA", (WIDTH, HEIGHT), (245, 245, 245, 255))
+            bg2 = Image.new("RGBA", (WIDTH, HEIGHT), (30, 30, 30, 255))
     else:
-        bg2 = Image.new("RGBA", (WIDTH, HEIGHT), (245, 245, 245, 255))
+        bg2 = Image.new("RGBA", (WIDTH, HEIGHT), (30, 30, 30, 255))
     draw2 = ImageDraw.Draw(bg2)
 
-    # header bar (light)
+    # header bar (light translucent) - but on full image we draw a translucent header to show contrast
     header_h = int(HEIGHT * 0.10)
-    draw2.rectangle([0, 0, WIDTH, header_h], fill=(255, 255, 255, 200))
+    draw2.rectangle([0, 0, WIDTH, header_h], fill=(255, 255, 255, 180))
     bbox = draw2.textbbox((0, 0), quote_title, font=font_h)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
     draw2.text(((WIDTH - tw) // 2, (header_h - th) // 2), quote_title, font=font_h, fill=(10, 10, 10))
 
-    # word-wrap quote (NO SHADOW)
+    # prepare no-header copy (same bg but without header rectangle/text)
+    bg_no_header = bg2.copy()
+    draw_no = ImageDraw.Draw(bg_no_header)
+    # erase header area by redrawing original background (if BG_IMAGE present, re-fit portion)
+    if Path(BG_IMAGE).exists():
+        try:
+            orig = Image.open(BG_IMAGE).convert("RGBA")
+            orig = ImageOps.fit(orig, (WIDTH, HEIGHT), method=Image.LANCZOS)
+            bg_no_header.paste(orig.crop((0, 0, WIDTH, header_h)), (0, 0))
+        except Exception:
+            # fallback to solid fill
+            draw_no.rectangle([0, 0, WIDTH, header_h], fill=(245, 245, 245, 255))
+    else:
+        draw_no.rectangle([0, 0, WIDTH, header_h], fill=(30, 30, 30, 255))
+
+    # word-wrap quote (NO SHADOW) and highlight some words with yellow marker
     margin_x = int(WIDTH * 0.08)
     max_w = WIDTH - margin_x * 2
     words = quote.split()
@@ -374,36 +415,71 @@ def render_base_images(quote_title: str, quote: str, out_dir: Path):
             cur = [w]
     if cur:
         lines.append(" ".join(cur))
-    line_h = getattr(font_q, "size", quote_size) + 6
+    line_h = getattr(font_q, "size", quote_size) + 8
     total_h = len(lines) * line_h
     y = max(header_h + 10, (HEIGHT // 2) - (total_h // 2))
 
+    # helper to draw line with highlights
+    def draw_line_with_highlight(draw_obj, text_line, x, y_pos, font):
+        parts = text_line.split(" ")
+        cursor = x
+        for p in parts:
+            clean = p.strip('.,!?:;').lower()
+            w = p + (" " if p is not parts[-1] else "")
+            w_len = draw_obj.textlength(w, font=font)
+            if clean in HIGHLIGHT_WORDS:
+                # draw yellow rounded rectangle behind the text
+                rect_w = draw_obj.textlength(p, font=font) + 8
+                rect_h = font.size + 6 if hasattr(font, 'size') else quote_size + 6
+                rect_x0 = cursor
+                rect_y0 = y_pos
+                rect_x1 = rect_x0 + rect_w
+                rect_y1 = rect_y0 + rect_h
+                draw_obj.rectangle([rect_x0, rect_y0, rect_x1, rect_y1], fill=(255, 230, 80))
+                # draw the word in black on top
+                draw_obj.text((cursor + 4, y_pos + 2), p, font=font, fill=(0, 0, 0))
+                cursor += rect_w
+                # add space
+                cursor += draw_obj.textlength(" ", font=font)
+            else:
+                draw_obj.text((cursor, y_pos + 2), p + " ", font=font, fill=(255, 255, 255))
+                cursor += draw_obj.textlength(p + " ", font=font)
+
+    # draw on full image (which currently has a translucent header drawn)
     for i, line in enumerate(lines):
         x = margin_x
         yy = y + i * line_h
-        # No shadow — put text directly
-        text_color = (255, 255, 255) if (sum(bg2.getpixel((x, yy))[:3]) < 400) else (0, 0, 0)
-        draw2.text((x, yy), line, font=font_q, fill=text_color)
+        draw_line_with_highlight(draw2, line, x, yy, font_q)
+
+    # draw on no-header image (same placement)
+    for i, line in enumerate(lines):
+        x = margin_x
+        yy = y + i * line_h
+        draw_line_with_highlight(draw_no, line, x, yy, font_q)
 
     full_path.parent.mkdir(parents=True, exist_ok=True)
     bg2.convert("RGB").save(full_path, "JPEG", quality=85, optimize=True)
+    bg_no_header.convert("RGB").save(full_no_header, "JPEG", quality=85, optimize=True)
 
-    log.info("Saved images: %s, %s", header_path, full_path)
-    return header_path, full_path
+    log.info("Saved images: %s, %s, %s", header_path, full_path, full_no_header)
+    return header_path, full_path, full_no_header
 
 # ---------- Video maker (segmented approach with fades) ----------
+
 def pick_random_audio():
     if not MUSIC_DIR.exists():
         return None
     files = [p for p in MUSIC_DIR.iterdir() if p.is_file() and p.suffix.lower() in (".mp3", ".m4a", ".wav", ".ogg", ".aac")]
     return random.choice(files) if files else None
 
-def make_staged_video(header_img: Path, full_img: Path, out_video: Path,
+
+def make_staged_video(header_img: Path, full_img: Path, full_no_header: Path, out_video: Path,
                       header_duration=2, full_total=6, fps=FPS):
     """
     Staged video:
       - header_img shown for header_duration (no fade on header)
-      - full_img shown for full_total seconds, with fade in (first 2s) and fade out (last 2s)
+      - background/quote (from full_no_header) shown for full_total seconds, with fade in/out
+      - header image is overlaid on top of the concatenated result so the header never fades
     """
     if full_total <= 4:
         raise ValueError("full_total should be at least 5 to allow fades (we recommend 6)")
@@ -413,10 +489,10 @@ def make_staged_video(header_img: Path, full_img: Path, out_video: Path,
         shutil.rmtree(tmp)
     tmp.mkdir(parents=True, exist_ok=True)
 
-    seg0 = tmp / "seg0.mp4"
-    seg1 = tmp / "seg1.mp4"
+    seg0 = tmp / "seg0.mp4"  # header static video
+    seg1 = tmp / "seg1.mp4"  # full_no_header with fades
 
-    # segment 0: header static (no fade)
+    # segment 0: header static (no fade) produced from header image
     cmd0 = [
         "ffmpeg", "-y",
         "-loop", "1", "-i", str(header_img),
@@ -426,14 +502,15 @@ def make_staged_video(header_img: Path, full_img: Path, out_video: Path,
         "-movflags", "+faststart",
         str(seg0)
     ]
-    # segment 1: full image with fade in/out
+
+    # segment 1: full_no_header image with fade in/out
     fade_in_d = min(2, full_total / 3)
     fade_out_d = min(2, full_total / 3)
     fade_out_start = full_total - fade_out_d
     vf = f"scale={WIDTH}:{HEIGHT},fps={fps},fade=t=in:st=0:d={fade_in_d},fade=t=out:st={fade_out_start}:d={fade_out_d}"
     cmd1 = [
         "ffmpeg", "-y",
-        "-loop", "1", "-i", str(full_img),
+        "-loop", "1", "-i", str(full_no_header),
         "-t", str(full_total),
         "-vf", vf,
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "23",
@@ -451,8 +528,6 @@ def make_staged_video(header_img: Path, full_img: Path, out_video: Path,
         if proc.returncode != 0:
             log.error("ffmpeg seg1 error: %s", proc.stderr.decode(errors="ignore")[:1000])
             raise RuntimeError("ffmpeg seg1 failed")
-
-    audio = pick_random_audio()
 
     list_txt = tmp / "inputs.txt"
     list_txt.write_text(f"file '{seg0.resolve()}'\nfile '{seg1.resolve()}'\n", encoding="utf-8")
@@ -481,11 +556,28 @@ def make_staged_video(header_img: Path, full_img: Path, out_video: Path,
                 log.error("concat fallback failed: %s", proc.stderr.decode(errors="ignore")[:1000])
                 raise RuntimeError("concat failed")
 
-    # if audio exists, mix audio to the final file (looped/trimmed)
+    # Now overlay the header image (static) on top of the concatenated video so header never fades
+    overlaid = tmp / "with_header.mp4"
+    cmd_overlay = [
+        "ffmpeg", "-y",
+        "-i", str(intermediate),
+        "-i", str(header_img),
+        "-filter_complex", f"[1:v]scale={WIDTH}:{HEIGHT}[ovr];[0:v][ovr]overlay=0:0:format=auto",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "23",
+        str(overlaid)
+    ]
+    with _timeit("ffmpeg_overlay_header"):
+        proc = subprocess.run(cmd_overlay, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            log.error("overlay failed: %s", proc.stderr.decode(errors="ignore")[:1000])
+            raise RuntimeError("overlay failed")
+
+    # if audio exists, mix audio to the final file (looped/trimmed) using the overlaid video
+    audio = pick_random_audio()
     if audio:
         cmd_mux = [
             "ffmpeg", "-y",
-            "-i", str(intermediate),
+            "-i", str(overlaid),
             "-stream_loop", "-1", "-i", str(audio),
             "-shortest",
             "-c:v", "copy",
@@ -501,7 +593,7 @@ def make_staged_video(header_img: Path, full_img: Path, out_video: Path,
     else:
         cmd_final = [
             "ffmpeg", "-y",
-            "-i", str(intermediate),
+            "-i", str(overlaid),
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "23",
             str(out_video)
         ]
@@ -570,7 +662,7 @@ def index():
     <html>
       <head><title>Gemini → YouTube Optimized</title></head>
         <body style='font-family: Arial, sans-serif; max-width:900px;margin:30px auto'>
-        <h1>Gemini → YouTube Optimized (Light)</h1>
+        <h1>Gemini → YouTube Optimized (Enhanced)</h1>
         <p>Authorized: <strong>{'Yes' if has_tokens else 'No'}</strong></p>
         <p>
           <a href='/auth/start'>Authorize YouTube</a> |
@@ -583,7 +675,7 @@ def index():
           Privacy: <select name='privacy'><option>public</option><option>unlisted</option><option>private</option></select>
           <button type='submit'>Generate & Upload</button>
         </form>
-        <p>Note: this lightweight variant uses {WIDTH}x{HEIGHT} images and conservative bitrate for small files.</p>
+        <p>Note: this variant keeps the header static (white header with black text) while the background and quote fade in/out. Important words are highlighted like a yellow marker.</p>
         <hr/>
         <p>Token file: <code>{TOKEN_FILE}</code></p>
       </body>
@@ -654,10 +746,10 @@ def generate_and_upload():
     quote = seo.get("quote") or "Keep going, you're closer than you think."
 
     tmpdir = APP_DIR / "tmp" / f"gen_{int(time.time())}"
-    header_img, full_img = render_base_images(quote_title, quote, tmpdir)
+    header_img, full_img, full_no_header = render_base_images(quote_title, quote, tmpdir)
     out_video = tmpdir / "out.mp4"
     try:
-        make_staged_video(header_img, full_img, out_video, header_duration=2, full_total=6, fps=FPS)
+        make_staged_video(header_img, full_img, full_no_header, out_video, header_duration=2, full_total=6, fps=FPS)
     except Exception as e:
         log.exception("video generation failed")
         return jsonify({'ok': False, 'error': str(e)})
