@@ -827,7 +827,7 @@ def generate_and_upload():
 
         # Instagram Upload
         try:
-            public_url = f"http://your-server-domain/serve-video/{final_video.name}"
+            public_url = f"https://quote-uploader-yt.onrender.com/serve-video/{final_video.name}"
             ig_resp = upload_instagram_reel(public_url, youtube_title)
             result['upload_instagram'] = ig_resp
         except Exception as e:
