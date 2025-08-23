@@ -1010,19 +1010,30 @@ def schedule_jobs():
 
 # ---------- Run server ----------
 if __name__ == "__main__":
-  scheduler_thread = threading.Thread(target=schedule_jobs)
-  scheduler_thread.daemon = True  # exits when main thread exits
-  scheduler_thread.start()
-  
+    # Start scheduler in a daemon thread
+    scheduler_thread = threading.Thread(target=schedule_jobs)
+    scheduler_thread.daemon = True  # exits when main thread exits
+    scheduler_thread.start()
+
+    # Check for ffmpeg availability
     if not shutil.which("ffmpeg"):
         log.warning("ffmpeg not found in PATH; video creation will fail. Install ffmpeg or add to PATH.")
     else:
         try:
-            proc = subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
-            log.info("ffmpeg available: %s", proc.stdout.decode().splitlines()[0] if proc.returncode == 0 else "unknown")
+            proc = subprocess.run(
+                ["ffmpeg", "-version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=3
+            )
+            log.info(
+                "ffmpeg available: %s",
+                proc.stdout.decode().splitlines()[0] if proc.returncode == 0 else "unknown"
+            )
         except Exception:
             log.debug("ffmpeg check failed", exc_info=True)
 
+    # Start Flask server
     port = int(os.getenv("PORT", "8000"))
     log.info("Starting server on 0.0.0.0:%d (WIDTH=%s HEIGHT=%s)", port, WIDTH, HEIGHT)
     app.run(host="0.0.0.0", port=port, debug=False)
