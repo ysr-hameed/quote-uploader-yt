@@ -558,27 +558,56 @@ def mux_audio_to_video(video_path: Path, out_path: Path, audio_path: Path):
     return out_path
 
 
-# ---------- Facebook & Instagram helpers ----------
 def upload_facebook_video(video_path: Path, title: str, description: str):
+    """
+    Upload a video to Facebook Page.
+    If FACEBOOK_ACCESS_TOKEN is a User token, try to fetch the Page token automatically.
+    """
     if not (FACEBOOK_PAGE_ID and FACEBOOK_ACCESS_TOKEN):
         return {"error": "Missing FACEBOOK_PAGE_ID or FACEBOOK_ACCESS_TOKEN"}
-    url = f"https://graph-video.facebook.com/v19.0/{FACEBOOK_PAGE_ID}/videos"
-    data = {
-        "title": title,
-        "description": description,
-        "published": "true",
-        "access_token": FACEBOOK_ACCESS_TOKEN,
-    }
+
+    # Step 1: Use given token, but verify
+    page_token = FACEBOOK_ACCESS_TOKEN
+
+    try:
+        url_test = f"https://graph.facebook.com/v19.0/{FACEBOOK_PAGE_ID}?fields=id&access_token={page_token}"
+        r_test = requests.get(url_test, timeout=10).json()
+        if "error" in r_test and r_test["error"].get("code") == 6000:
+            # token is likely a User token; fetch Page token
+            log.info("Current token cannot upload. Fetching Page token automatically.")
+            resp = requests.get(
+                f"https://graph.facebook.com/v19.0/me/accounts",
+                params={"access_token": FACEBOOK_ACCESS_TOKEN},
+                timeout=10
+            )
+            resp.raise_for_status()
+            pages = resp.json().get("data", [])
+            for p in pages:
+                if str(p.get("id")) == str(FACEBOOK_PAGE_ID):
+                    page_token = p.get("access_token")
+                    break
+            if not page_token:
+                return {"error": f"Could not fetch Page token for Page ID {FACEBOOK_PAGE_ID}"}
+    except Exception as e:
+        log.warning("Page token check/fetch failed: %s", e)
+        return {"error": f"Page token check/fetch failed: {e}"}
+
+    # Step 2: Upload the video
     try:
         with open(video_path, "rb") as f:
             files = {"source": f}
+            data = {
+                "title": title,
+                "description": description,
+                "published": "true",
+                "access_token": page_token,
+            }
+            url = f"https://graph-video.facebook.com/v19.0/{FACEBOOK_PAGE_ID}/videos"
             resp = SESSION.post(url, files=files, data=data, timeout=600)
-        # Return raw for transparency
-        return resp.json()
+            return resp.json()
     except Exception as e:
         log.exception("FB upload exception")
         return {"error": str(e)}
-
 
 IG_STATUS_FIELDS = "status_code,status,video_status,id"
 
