@@ -7,6 +7,8 @@ import random
 import logging
 import subprocess
 import secrets
+import schedule
+import threading
 import re
 import shutil
 from pathlib import Path
@@ -965,8 +967,53 @@ def serve_video(filename):
     return send_from_directory(VIDEO_FOLDER, filename, as_attachment=False)
 
 
+
+
+
+
+
+
+
+
+# ----------------- CONFIG -----------------
+GENERATE_URL = "https://quote-uploader-yt.onrender.com/generate-and-upload"
+
+# ----------------- FLASK ROUTES -----------------
+
+# ----------------- SCHEDULER FUNCTION -----------------
+def run_job():
+    print(f"[{datetime.now()}] Running video upload job...")
+    try:
+        response = requests.get(GENERATE_URL, timeout=600)  # 10 min timeout
+        print(f"[{datetime.now()}] Job response: {response.text}")
+    except Exception as e:
+        print(f"[{datetime.now()}] Job error: {e}")
+
+def schedule_jobs():
+    # Schedule 5 times per day
+    schedule.every().day.at("08:00").do(run_job)
+    schedule.every().day.at("11:00").do(run_job)
+    schedule.every().day.at("14:00").do(run_job)
+    schedule.every().day.at("17:00").do(run_job)
+    schedule.every().day.at("20:00").do(run_job)
+
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
+
+
+
+
+
+
+
+
 # ---------- Run server ----------
 if __name__ == "__main__":
+  scheduler_thread = threading.Thread(target=schedule_jobs)
+  scheduler_thread.daemon = True  # exits when main thread exits
+  scheduler_thread.start()
+  
     if not shutil.which("ffmpeg"):
         log.warning("ffmpeg not found in PATH; video creation will fail. Install ffmpeg or add to PATH.")
     else:
