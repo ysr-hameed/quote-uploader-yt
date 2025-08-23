@@ -13,19 +13,19 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
-from flask import Flask, request, jsonify, redirect, Response, session,send_from_directory, url_for
+from flask import Flask, request, jsonify, redirect, Response, session, send_from_directory, url_for
 from dotenv import load_dotenv, find_dotenv
+from urllib.parse import urlencode, urljoin
 
 # ---------- CONFIG & STARTUP ----------
 APP_DIR = Path(__file__).resolve().parent
 ENV_PATH = find_dotenv(usecwd=True) or str(APP_DIR / ".env")
 load_dotenv(ENV_PATH)
 
+# Where final, publicly served videos live
+VIDEO_FOLDER = APP_DIR / "generated_videos"
+VIDEO_FOLDER.mkdir(parents=True, exist_ok=True)
 
-
-
-VIDEO_FOLDER = Path("generated_videos")  # store videos here
-VIDEO_FOLDER.mkdir(exist_ok=True)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("gemini_youtube_opt_fast")
@@ -44,7 +44,7 @@ QUOTE_FONT_PATH = os.getenv("QUOTE_FONT", str(APP_DIR / "Ubuntu-Regular.ttf"))
 BG_IMAGE = os.getenv("BG_IMAGE", str(APP_DIR / "bg.jpg"))
 
 # Gemini / Google LLM
-API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCrM0AzC6PLJCcxr0pIljAUGPV-WAe_PAk")
+API_KEY = os.getenv("GEMINI_API_KEY", "")
 MODEL_URL = os.getenv(
     "GEMINI_MODEL_URL",
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
@@ -53,48 +53,11 @@ GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "45"))
 GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.35"))
 GEMINI_MAX_TOKENS = int(os.getenv("GEMINI_MAX_TOKENS", "1200"))  # long desc + 100+ hashtags
 
-
-
+# Facebook / Instagram (Graph API)
 FACEBOOK_PAGE_ID = os.getenv("FACEBOOK_PAGE_ID")
-FACEBOOK_ACCESS_TOKEN = os.getenv("FACEBOOK_ACCESS_TOKEN")  # Make sure this is a PAGE access token
-INSTAGRAM_USER_ID = os.getenv("INSTAGRAM_USER_ID")
+FACEBOOK_ACCESS_TOKEN = os.getenv("FACEBOOK_ACCESS_TOKEN")  # **MUST be a PAGE access token**
+INSTAGRAM_USER_ID = os.getenv("INSTAGRAM_USER_ID")  # IG Business/Creator user id (linked to the Page)
 
-
-def upload_facebook_video(video_path, title, description):
-    url = f"https://graph-video.facebook.com/v19.0/{FACEBOOK_PAGE_ID}/videos"
-    files = {'source': open(video_path, 'rb')}
-    data = {
-        'title': title,
-        'description': description,
-        'access_token': FACEBOOK_ACCESS_TOKEN
-    }
-    resp = requests.post(url, files=files, data=data)
-    return resp.json()
-
-
-def upload_instagram_reel(video_url, caption):
-    url = f"https://graph.facebook.com/v19.0/{INSTAGRAM_USER_ID}/media"
-    data = {
-        'caption': caption,
-        'media_type': 'REELS',
-        'video_url': video_url,  # now a public URL
-        'access_token': FACEBOOK_ACCESS_TOKEN
-    }
-    resp = requests.post(url, data=data).json()
-
-    if "id" in resp:
-        # Publish after upload
-        creation_id = resp["id"]
-        publish_url = f"https://graph.facebook.com/v19.0/{INSTAGRAM_USER_ID}/media_publish"
-        publish_data = {
-            "creation_id": creation_id,
-            "access_token": FACEBOOK_ACCESS_TOKEN
-        }
-        publish_resp = requests.post(publish_url, data=publish_data).json()
-        return publish_resp
-
-    return resp
-    
 # OAuth / YouTube
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
@@ -127,6 +90,7 @@ def _make_session():
 
 SESSION = _make_session()
 
+
 def _timeit(name):
     class _Ctx:
         def __enter__(self):
@@ -138,6 +102,7 @@ def _timeit(name):
             log.info("%s took %.2f sec", name, elapsed)
     return _Ctx()
 
+
 def _load_tokens():
     try:
         text = TOKEN_FILE.read_text(encoding="utf-8")
@@ -146,13 +111,29 @@ def _load_tokens():
         log.exception("failed to read token file, returning empty")
         return {}
 
+
 def _save_tokens(obj):
     try:
         TOKEN_FILE.write_text(json.dumps(obj, indent=2), encoding="utf-8")
     except Exception:
         log.exception("failed to save tokens")
 
-# OAuth helpers
+
+# ---------- URL helpers ----------
+def _public_base_url():
+    """Try to construct a public base URL that respects reverse proxy headers."""
+    proto = request.headers.get("X-Forwarded-Proto", request.scheme)
+    host = request.headers.get("X-Forwarded-Host", request.host)
+    return f"{proto}://{host}/"
+
+
+def build_public_video_url(filename: str) -> str:
+    # Serve from our Flask route; must be publicly reachable and HTTPS for IG
+    base = _public_base_url()
+    return urljoin(base, f"serve-video/{filename}")
+
+
+# ---------- OAuth helpers ----------
 def _build_auth_url(state: str):
     params = {
         "client_id": GOOGLE_CLIENT_ID,
@@ -163,8 +144,8 @@ def _build_auth_url(state: str):
         "prompt": "consent",
         "state": state,
     }
-    from urllib.parse import urlencode
     return f"{OAUTH_AUTH_URL}?{urlencode(params)}"
+
 
 def exchange_code_for_tokens(code: str):
     with _timeit("exchange_code_for_tokens"):
@@ -183,6 +164,7 @@ def exchange_code_for_tokens(code: str):
             token_resp["expires_at"] = token_resp["obtained_at"] + int(token_resp["expires_in"]) - 30
         _save_tokens(token_resp)
         return token_resp
+
 
 def refresh_access_token(refresh_token: str):
     with _timeit("refresh_access_token"):
@@ -205,6 +187,7 @@ def refresh_access_token(refresh_token: str):
         _save_tokens(existing)
         return existing
 
+
 def ensure_valid_token():
     tokens = _load_tokens()
     if not tokens:
@@ -221,7 +204,8 @@ def ensure_valid_token():
         log.error("Failed to refresh token: %s", e)
         return None
 
-# ---------- Gemini prompt (updated for forced-JSON) ----------
+
+# ---------- Gemini prompt (forced JSON) ----------
 PROMPT_TEMPLATE = """
 You are a generator that returns ONLY JSON. No code fences, no commentary.
 
@@ -268,29 +252,23 @@ Return strictly in this JSON shape:
 }
 """
 
+
 def _strip_code_fences(text: str) -> str:
-    # Remove ```json ... ``` or ``` ... ``` wrappers and stray backticks
     if not text:
         return text
     text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text.strip(), flags=re.IGNORECASE)
     return text.strip()
 
+
 def _extract_first_json_object(text: str):
-    """
-    Robustly extract the first top-level JSON object from text (if any).
-    """
     if not text:
         return None
     text = _strip_code_fences(text)
-
-    # Fast path: direct parse
     try:
         return json.loads(text)
     except Exception:
         pass
-
-    # Brace-balance scan
     start = text.find("{")
     if start == -1:
         return None
@@ -308,8 +286,8 @@ def _extract_first_json_object(text: str):
                     continue
     return None
 
+
 def _enforce_schema(d: dict) -> dict:
-    # Ensure required keys exist and types are right; fill light defaults.
     if not isinstance(d, dict):
         d = {}
     return {
@@ -320,10 +298,8 @@ def _enforce_schema(d: dict) -> dict:
         "youtube_tags": list(d.get("youtube_tags") or ["motivation", "success", "life lessons", "self improvement"])
     }
 
+
 def _call_gemini(prompt: str, timeout: int = GEMINI_TIMEOUT, retries: int = 2):
-    """
-    Force JSON response via responseMimeType and parse deterministically.
-    """
     if not API_KEY:
         raise RuntimeError("GEMINI_API_KEY is required")
 
@@ -344,58 +320,34 @@ def _call_gemini(prompt: str, timeout: int = GEMINI_TIMEOUT, retries: int = 2):
                 r = SESSION.post(MODEL_URL, headers=headers, json=payload, timeout=timeout)
             r.raise_for_status()
             data = r.json()
-
-            # Read concatenated parts text if present
             parts = (
                 data.get("candidates", [{}])[0]
                 .get("content", {})
                 .get("parts", [])
             )
             text = "".join([p.get("text", "") for p in parts]) if parts else ""
-
             if not text:
-                # Sometimes the API may return a top-level "promptFeedback" error or empty text
                 log.warning("Gemini returned empty text; raw=%s", json.dumps(data)[:2000])
-                # Try to fall back to entire JSON string of candidate
                 text = json.dumps(data.get("candidates", [{}])[0].get("content", {}))
-
-            # Try direct JSON load, else extract
             try:
                 obj = json.loads(_strip_code_fences(text))
             except Exception:
                 obj = _extract_first_json_object(text)
-
             if not obj:
                 log.warning("Failed to parse JSON from Gemini text; beginning extraction fallback")
                 obj = _extract_first_json_object(text)
-
             if not obj:
                 raise ValueError("No JSON object could be parsed from Gemini response")
-
-            # Enforce schema
             obj = _enforce_schema(obj)
             return obj
-
         except Exception as e:
             last_err = e
             log.warning("Gemini attempt %d failed: %s", attempt + 1, e)
             time.sleep(0.6 * (attempt + 1))
-
-    # Total failure: return sane defaults
     log.warning("Gemini call failed after retries, using fallback. Last error: %s", last_err)
     return _enforce_schema({})
 
-def parse_gemini_json_block_safe(text: str):
-    """
-    Kept for compatibility; now unused by fetch_quote_from_gemini.
-    """
-    text = re.sub(r"```json|```", "", str(text or ""), flags=re.IGNORECASE).strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        return _extract_first_json_object(text)
 
-# ---------- Fetcher ----------
 def fetch_quote_from_gemini(seed="motivation"):
     prompt = PROMPT_TEMPLATE + f"\nTopic: {seed}\n"
     try:
@@ -403,9 +355,8 @@ def fetch_quote_from_gemini(seed="motivation"):
         return parsed
     except Exception as e:
         log.warning("Gemini call failed: %s", e)
-
-    # fallback
     return _enforce_schema({})
+
 
 # ---------- Fonts ----------
 def _load_font(path, size):
@@ -416,6 +367,7 @@ def _load_font(path, size):
         log.debug("failed to load font %s", path, exc_info=True)
     return ImageFont.load_default()
 
+
 # ---------- Fast frame-based video generator ----------
 FADE_DELAY = float(os.getenv("FADE_DELAY", "1.5"))
 FADE_DURATION = float(os.getenv("FADE_DURATION", "2"))
@@ -424,13 +376,13 @@ FADE_OUT_DURATION = float(os.getenv("FADE_OUT_DURATION", "2"))
 
 FRAMES_DIR_BASE = APP_DIR / "tmp" / "frames"
 
+
 def generate_static_layers(header_text: str, quote_text: str, width=WIDTH, height=HEIGHT):
     header_font_size = max(28, width // 14)
     quote_font_size = max(26, width // 20)
     font_header = _load_font(HEADER_FONT_PATH, header_font_size)
     font_quote = _load_font(QUOTE_FONT_PATH, quote_font_size)
 
-    # Header layer (white bar with centered text)
     header_img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(header_img)
     header_h = int(height * 0.12)
@@ -440,7 +392,6 @@ def generate_static_layers(header_text: str, quote_text: str, width=WIDTH, heigh
     th = bbox[3] - bbox[1]
     draw.text(((width - tw) // 2, (header_h - th) // 2), header_text, font=font_header, fill=(0, 0, 0))
 
-    # Content layer (background image plus quote text)
     if Path(BG_IMAGE).exists():
         try:
             bg = Image.open(BG_IMAGE).convert("RGBA")
@@ -454,7 +405,6 @@ def generate_static_layers(header_text: str, quote_text: str, width=WIDTH, heigh
     content_img = bg.copy()
     content_draw = ImageDraw.Draw(content_img)
 
-    # word-wrap quote into lines that fit max width
     margin_x = int(width * 0.08)
     max_w = width - 2 * margin_x
     words = quote_text.split()
@@ -471,7 +421,6 @@ def generate_static_layers(header_text: str, quote_text: str, width=WIDTH, heigh
     if cur:
         lines.append(" ".join(cur))
 
-    # draw lines centered vertically (below header)
     line_h = getattr(font_quote, "size", quote_font_size) + 12
     total_h = len(lines) * line_h
     y_start = max(int(height * 0.18), (height // 2) - (total_h // 2))
@@ -497,12 +446,10 @@ def generate_static_layers(header_text: str, quote_text: str, width=WIDTH, heigh
 
     return header_img.convert("RGBA"), content_img.convert("RGBA")
 
+
 def generate_frames_and_encode(header_img: Image.Image, content_img: Image.Image, out_video: Path,
                                duration: int = DURATION_TOTAL, fps: int = FPS):
-    # Always use one fixed frames folder
     frames_dir = FRAMES_DIR_BASE / "frames"
-
-    # Cleanup before starting new generation
     if frames_dir.exists():
         shutil.rmtree(frames_dir)
     frames_dir.mkdir(parents=True, exist_ok=True)
@@ -577,19 +524,20 @@ def generate_frames_and_encode(header_img: Image.Image, content_img: Image.Image
             log.error("ffmpeg encode failed: %s", proc.stderr.decode(errors="ignore")[:2000])
             raise RuntimeError("ffmpeg encoding failed")
 
-    # Cleanup frames after encoding
     try:
         shutil.rmtree(frames_dir)
     except Exception:
         pass
 
     return out_video
-    
+
+
 def pick_random_audio():
     if not MUSIC_DIR.exists():
         return None
     files = [p for p in MUSIC_DIR.iterdir() if p.is_file() and p.suffix.lower() in (".mp3", ".m4a", ".wav", ".ogg", ".aac")]
     return random.choice(files) if files else None
+
 
 def mux_audio_to_video(video_path: Path, out_path: Path, audio_path: Path):
     cmd = [
@@ -609,6 +557,87 @@ def mux_audio_to_video(video_path: Path, out_path: Path, audio_path: Path):
             raise RuntimeError("audio mux failed")
     return out_path
 
+
+# ---------- Facebook & Instagram helpers ----------
+def upload_facebook_video(video_path: Path, title: str, description: str):
+    if not (FACEBOOK_PAGE_ID and FACEBOOK_ACCESS_TOKEN):
+        return {"error": "Missing FACEBOOK_PAGE_ID or FACEBOOK_ACCESS_TOKEN"}
+    url = f"https://graph-video.facebook.com/v19.0/{FACEBOOK_PAGE_ID}/videos"
+    data = {
+        "title": title,
+        "description": description,
+        "published": "true",
+        "access_token": FACEBOOK_ACCESS_TOKEN,
+    }
+    try:
+        with open(video_path, "rb") as f:
+            files = {"source": f}
+            resp = SESSION.post(url, files=files, data=data, timeout=600)
+        # Return raw for transparency
+        return resp.json()
+    except Exception as e:
+        log.exception("FB upload exception")
+        return {"error": str(e)}
+
+
+IG_STATUS_FIELDS = "status_code,status,video_status,id"
+
+def create_instagram_reel_container(video_url: str, caption: str):
+    url = f"https://graph.facebook.com/v19.0/{INSTAGRAM_USER_ID}/media"
+    data = {
+        "caption": caption,
+        "media_type": "REELS",
+        "video_url": video_url,
+        "access_token": FACEBOOK_ACCESS_TOKEN,
+    }
+    r = SESSION.post(url, data=data, timeout=60)
+    return r.json()
+
+
+def wait_for_ig_container(creation_id: str, timeout_s: int = 120, poll_every: float = 3.0):
+    """Poll container until FINISHED or ERROR."""
+    url = f"https://graph.facebook.com/v19.0/{creation_id}"
+    params = {"fields": IG_STATUS_FIELDS, "access_token": FACEBOOK_ACCESS_TOKEN}
+    t0 = time.time()
+    last = {}
+    while time.time() - t0 < timeout_s:
+        r = SESSION.get(url, params=params, timeout=30)
+        last = r.json()
+        status = last.get("status_code") or last.get("status") or last.get("video_status")
+        log.info("IG container %s status: %s", creation_id, status)
+        if status in ("FINISHED", "FINISH", "READY"):
+            return {"ok": True, "last": last}
+        if status in ("ERROR", "FAILED"):
+            return {"ok": False, "last": last}
+        time.sleep(poll_every)
+    return {"ok": False, "last": last, "timeout": True}
+
+
+def publish_instagram_container(creation_id: str):
+    url = f"https://graph.facebook.com/v19.0/{INSTAGRAM_USER_ID}/media_publish"
+    data = {"creation_id": creation_id, "access_token": FACEBOOK_ACCESS_TOKEN}
+    r = SESSION.post(url, data=data, timeout=60)
+    return r.json()
+
+
+def upload_instagram_reel_via_url(video_url: str, caption: str):
+    if not (INSTAGRAM_USER_ID and FACEBOOK_ACCESS_TOKEN):
+        return {"error": "Missing INSTAGRAM_USER_ID or FACEBOOK_ACCESS_TOKEN"}
+    try:
+        container = create_instagram_reel_container(video_url, caption)
+        if "id" not in container:
+            return {"step": "create_container", "response": container}
+        creation_id = container["id"]
+        wait = wait_for_ig_container(creation_id)
+        if not wait.get("ok"):
+            return {"step": "wait_container", "response": wait}
+        publish = publish_instagram_container(creation_id)
+        return {"step": "publish", "response": publish}
+    except Exception as e:
+        log.exception("IG upload exception")
+        return {"error": str(e)}
+
+
 # ---------- YouTube helpers (resumable upload) ----------
 def _auth_headers():
     token = ensure_valid_token()
@@ -616,12 +645,14 @@ def _auth_headers():
         raise RuntimeError("Not authorized. Please /auth/start to connect a Google account.")
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
+
 def list_channels():
     headers = _auth_headers()
     params = {"part": "snippet,contentDetails,statistics", "mine": "true"}
     r = SESSION.get(YOUTUBE_CHANNELS_URL, headers=headers, params=params, timeout=15)
     r.raise_for_status()
     return r.json()
+
 
 def upload_video_resumable(video_path: Path, title: str, description: str, tags: list, privacyStatus: str = "public"):
     with _timeit("upload_video_resumable"):
@@ -656,10 +687,17 @@ def upload_video_resumable(video_path: Path, title: str, description: str, tags:
             put.raise_for_status()
         return put.json()
 
+
 # ---------- Flask endpoints ----------
 @app.route("/health", methods=["GET"])
 def health():
-    return {"status": "ok", "message": "Service running"}, 200
+    ok = True
+    msg = "Service running"
+    if not shutil.which("ffmpeg"):
+        ok = False
+        msg += " (WARNING: ffmpeg missing)"
+    return {"status": "ok" if ok else "warn", "message": msg}, 200
+
 
 @app.get("/debug/gemini")
 def debug_gemini():
@@ -667,6 +705,7 @@ def debug_gemini():
     prompt = PROMPT_TEMPLATE + f"\nTopic: {topic}\n"
     obj = _call_gemini(prompt)
     return jsonify({"ok": True, "parsed": obj})
+
 
 @app.get("/")
 def index():
@@ -691,13 +730,15 @@ def index():
           <label><input type='checkbox' name='no_upload' value='1'/> Skip upload</label>
           <button type='submit'>Generate</button>
         </form>
-        <p>Fast generator uses pre-rendered frames + ffmpeg for faster, consistent output.</p>
+        <p>Fast generator uses pre-rendered frames + ffmpeg for faster, consistent output.</n>
         <hr/>
+        <p>Videos are served from: <code>{VIDEO_FOLDER}</code></p>
         <p>Token file: <code>{TOKEN_FILE}</code></p>
       </body>
     </html>
     """
     return Response(html, mimetype="text/html")
+
 
 @app.get('/auth/start')
 def auth_start():
@@ -706,6 +747,7 @@ def auth_start():
     state = secrets.token_urlsafe(16)
     session['oauth_state'] = state
     return redirect(_build_auth_url(state))
+
 
 @app.get('/auth/callback')
 def auth_callback():
@@ -717,11 +759,12 @@ def auth_callback():
     if not code or state != session.get('oauth_state'):
         return Response("Invalid state or missing code", status=400)
     try:
-        tok = exchange_code_for_tokens(code)
+        _ = exchange_code_for_tokens(code)
         return redirect(url_for('index'))
     except Exception as e:
         log.exception("Token exchange failed")
         return Response(f"Token exchange failed: {e}", status=500)
+
 
 @app.get('/auth/revoke')
 def auth_revoke():
@@ -741,6 +784,7 @@ def auth_revoke():
     _save_tokens({})
     return redirect(url_for('index'))
 
+
 @app.get('/channels')
 def channels_endpoint():
     try:
@@ -750,6 +794,7 @@ def channels_endpoint():
         log.exception('channels failed')
         return jsonify({'ok': False, 'error': str(e)})
 
+
 @app.get('/generate-and-upload')
 def generate_and_upload():
     topic = request.args.get('topic', 'motivation')
@@ -757,6 +802,9 @@ def generate_and_upload():
     skip_upload = request.args.get('no_upload') == '1'
     duration = int(request.args.get('duration', str(DURATION_TOTAL)))
     duration = max(3, min(MAX_DURATION, duration))
+
+    if not API_KEY:
+        return jsonify({'ok': False, 'error': 'GEMINI_API_KEY missing'}), 400
 
     # Fetch quote + YouTube metadata
     gemini_data = fetch_quote_from_gemini(topic)
@@ -771,8 +819,7 @@ def generate_and_upload():
 
     header_img, content_img = generate_static_layers(quote_title, quote_text, width=WIDTH, height=HEIGHT)
     out_video_tmp = tmpdir / "out_no_audio.mp4"
-    out_video_final = tmpdir / "out_final.mp4"
-    final_video = VIDEO_FOLDER / "out_final.mp4"
+    out_video_final_tmp = tmpdir / "out_final.mp4"
 
     try:
         generate_frames_and_encode(header_img, content_img, out_video_tmp, duration=duration, fps=FPS)
@@ -780,20 +827,24 @@ def generate_and_upload():
         log.exception("video generation failed")
         return jsonify({'ok': False, 'error': str(e)})
 
+    final_tmp = out_video_tmp
     audio = pick_random_audio()
     if audio:
         try:
-            mux_audio_to_video(out_video_tmp, out_video_final, audio)
-            final_video = out_video_final
+            mux_audio_to_video(out_video_tmp, out_video_final_tmp, audio)
+            final_tmp = out_video_final_tmp
             try:
                 out_video_tmp.unlink()
             except Exception:
                 pass
         except Exception as e:
             log.warning("audio mux failed: %s", e)
-            final_video = out_video_tmp
-    else:
-        final_video = out_video_tmp
+            final_tmp = out_video_tmp
+
+    # Move to public VIDEO_FOLDER with a unique name
+    unique_name = f"reel_{int(time.time())}_{secrets.token_hex(3)}.mp4"
+    public_path = VIDEO_FOLDER / unique_name
+    shutil.move(str(final_tmp), str(public_path))
 
     result = {
         'ok': True,
@@ -804,31 +855,31 @@ def generate_and_upload():
             'youtube_description': youtube_description,
             'youtube_tags': youtube_tags
         },
-        'file': str(final_video)
+        'file': str(public_path),
+        'public_url': build_public_video_url(unique_name)
     }
 
     # ---------- UPLOAD SECTION ----------
     if not skip_upload:
         # YouTube Upload
         try:
-            upload_resp = upload_video_resumable(final_video, youtube_title, youtube_description, youtube_tags, privacyStatus=privacy)
+            upload_resp = upload_video_resumable(public_path, youtube_title, youtube_description, youtube_tags, privacyStatus=privacy)
             result['upload_youtube'] = upload_resp
         except Exception as e:
             log.warning("YouTube upload failed: %s", e)
             result['upload_youtube_error'] = str(e)
 
-        # Facebook Upload
+        # Facebook Upload (Page video)
         try:
-            fb_resp = upload_facebook_video(final_video, youtube_title, youtube_description)
+            fb_resp = upload_facebook_video(public_path, youtube_title, youtube_description)
             result['upload_facebook'] = fb_resp
         except Exception as e:
             log.warning("Facebook upload failed: %s", e)
             result['upload_facebook_error'] = str(e)
 
-        # Instagram Upload
+        # Instagram Upload (Reels via public URL)
         try:
-            public_url = f"https://quote-uploader-yt.onrender.com/serve-video/{final_video.name}"
-            ig_resp = upload_instagram_reel(public_url, youtube_title)
+            ig_resp = upload_instagram_reel_via_url(result['public_url'], youtube_title)
             result['upload_instagram'] = ig_resp
         except Exception as e:
             log.warning("Instagram upload failed: %s", e)
@@ -836,11 +887,12 @@ def generate_and_upload():
 
     return jsonify(result)
 
+
 @app.post('/upload')
 def upload_endpoint():
     if 'video' not in request.files:
         return jsonify({'ok': False, 'error': 'no file uploaded'})
-    
+
     f = request.files['video']
     title = request.form.get('title') or None
     description = request.form.get('description') or None
@@ -864,23 +916,26 @@ def upload_endpoint():
             description = description or ""
             tags = tags or []
 
-    out_path = APP_DIR / 'tmp' / f.filename
+    # Save uploaded file directly to public folder so it's servable
+    public_name = f"upload_{int(time.time())}_{secrets.token_hex(3)}_{f.filename}"
+    out_path = VIDEO_FOLDER / public_name
     out_path.parent.mkdir(parents=True, exist_ok=True)
     f.save(out_path)
 
     try:
         res = upload_video_resumable(out_path, title, description, tags, privacyStatus=privacy)
-        return jsonify({'ok': True, 'file': str(out_path), 'upload': res})
+        return jsonify({'ok': True, 'file': str(out_path), 'public_url': build_public_video_url(public_name), 'upload': res})
     except Exception as e:
         log.warning('upload failed or not authorized: %s', e)
-        return jsonify({'ok': False, 'error': str(e)})
+        return jsonify({'ok': False, 'file': str(out_path), 'public_url': build_public_video_url(public_name), 'error': str(e)})
 
 
-
-@app.route("/serve-video/<filename>")
+@app.route("/serve-video/<path:filename>")
 def serve_video(filename):
+    # Allow range requests would be nicer, but simple send works for IG fetches
     return send_from_directory(VIDEO_FOLDER, filename, as_attachment=False)
-    
+
+
 # ---------- Run server ----------
 if __name__ == "__main__":
     if not shutil.which("ffmpeg"):
