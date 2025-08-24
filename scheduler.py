@@ -5,7 +5,7 @@ import threading
 import time
 from datetime import datetime
 import logging
-import pytz  # use pytz for Termux compatibility
+import pytz  # use pytz for Termux/Render compatibility
 
 app = Flask(__name__)
 
@@ -54,15 +54,23 @@ def run_job():
         logger.info("=" * 60)
         log_next_job_time()
 
+# ----------------- SCHEDULER WITH IST → UTC CONVERSION -----------------
 def schedule_jobs():
-    # Schedule 5 times per day (IST)
-    schedule.every().day.at("08:00").do(run_job)
-    schedule.every().day.at("11:00").do(run_job)
-    schedule.every().day.at("14:00").do(run_job)
-    schedule.every().day.at("17:00").do(run_job)
-    schedule.every().day.at("20:00").do(run_job)
+    # IST times you want the jobs to run
+    ist_times = ["08:00", "11:00", "14:00", "17:00", "20:00"]
+    
+    for ist_time in ist_times:
+        hours, minutes = map(int, ist_time.split(":"))
+        # Convert IST to UTC
+        utc_hour = (hours - 5) % 24
+        utc_minute = (minutes - 30) % 60
+        if minutes < 30:
+            utc_hour = (utc_hour - 1) % 24
+        utc_time = f"{utc_hour:02d}:{utc_minute:02d}"
+        schedule.every().day.at(utc_time).do(run_job)
+        logger.info(f"Scheduled job for IST {ist_time} → UTC {utc_time}")
 
-    logger.info("📅 Scheduler started with 5 daily jobs (IST)")
+    logger.info("📅 Scheduler started with 5 daily jobs (IST → UTC conversion)")
     log_next_job_time()
 
     # Run one job immediately on startup
